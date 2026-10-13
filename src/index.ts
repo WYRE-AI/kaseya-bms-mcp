@@ -6,6 +6,14 @@
  * It accepts credentials via environment variables (env mode) or per-request
  * HTTP headers (gateway mode). Supports both stdio (default) and HTTP
  * (StreamableHTTP) transports.
+ *
+ * HTTP transport refuses to start unless CONDUIT_S2S_SECRET is a real secret.
+ * A known placeholder is never accepted. MCP_ALLOW_INSECURE_DEV=1 is a
+ * local-only escape hatch for an empty secret: it logs a warning, skips
+ * X-Gateway-S2S, and listens on 127.0.0.1 only. A configured secret still
+ * honors MCP_HTTP_HOST (default 0.0.0.0). Gateway mode rejects /mcp when
+ * credential headers are missing and does not fall back to process.env.
+ * /health stays unauthenticated. stdio does not use S2S auth.
  */
 
 import { createServer, IncomingMessage, ServerResponse, Server as HttpServer } from "node:http";
@@ -32,8 +40,6 @@ import {
 } from "./card.builder.js";
 import { TICKET_CARD_HTML } from "./generated/ticket-card-html.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
-
-const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
 // ---------------------------------------------------------------------------
 // Credentials
@@ -532,18 +538,131 @@ async function startStdioTransport(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP service-to-service auth
+// ---------------------------------------------------------------------------
+
+/**
+ * Public example values. A copied placeholder must not verify as a real
+ * secret, and it is not bypassed by MCP_ALLOW_INSECURE_DEV.
+ */
+export const KNOWN_PLACEHOLDER_SECRETS = new Set([
+  "replace-with-a-real-secret",
+  "your-s2s-secret",
+  "your-secret",
+  "changeme",
+  "change-me",
+  "placeholder",
+  "secret",
+  "example",
+  "replace-me",
+  "s2s-secret",
+]);
+
+const MISSING_S2S_SECRET_ERROR =
+  "Refusing to start HTTP server: CONDUIT_S2S_SECRET is empty. " +
+  "Set CONDUIT_S2S_SECRET to the gateway-provisioned secret (openssl rand -hex 32), " +
+  "or set MCP_ALLOW_INSECURE_DEV=1 for local development only.";
+
+const PLACEHOLDER_S2S_SECRET_ERROR =
+  "Refusing to start HTTP server: CONDUIT_S2S_SECRET is a known placeholder. " +
+  "Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value.";
+
+const INSECURE_DEV_WARNING =
+  "SECURITY WARNING: CONDUIT_S2S_SECRET is unset and MCP_ALLOW_INSECURE_DEV=1. " +
+  "HTTP /mcp is starting with service-to-service authentication DISABLED, bound to 127.0.0.1 only. " +
+  "Local development only; do not expose this port.";
+
+const LOOPBACK_HOST = "127.0.0.1";
+/** Bind used when a real secret is set and MCP_HTTP_HOST is unset. Container images set 0.0.0.0 explicitly. */
+const SECRET_DEFAULT_HOST = "0.0.0.0";
+
+const S2S_UNAUTHORIZED = {
+  error:
+    "Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.",
+};
+
+function exitWithError(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function isKnownPlaceholderSecret(secret: string): boolean {
+  return KNOWN_PLACEHOLDER_SECRETS.has(secret.toLowerCase()) || CONFIG_PLACEHOLDER.test(secret);
+}
+
+/** 127.0.0.0/8, localhost, and ::1. Bracketed IPv6 forms count too. */
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const bare = normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
+  const parts = bare.split(".");
+  if (parts.length !== 4) return false;
+  if (parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false;
+  return parts[0] === "127";
+}
+
+/**
+ * Fail closed. An empty CONDUIT_S2S_SECRET used to skip X-Gateway-S2S.
+ * A known placeholder is refused even when MCP_ALLOW_INSECURE_DEV=1, so a
+ * copied example cannot sign requests. The secret value is never logged.
+ */
+function resolveHttpS2sSecret(): { secret: string; insecureDev: boolean } {
+  const raw = (process.env.CONDUIT_S2S_SECRET ?? "").trim();
+  if (raw && isKnownPlaceholderSecret(raw)) {
+    exitWithError(PLACEHOLDER_S2S_SECRET_ERROR);
+  }
+  if (raw) return { secret: raw, insecureDev: false };
+  if (process.env.MCP_ALLOW_INSECURE_DEV === "1") {
+    console.error("================================================================");
+    console.error(INSECURE_DEV_WARNING);
+    console.error("================================================================");
+    return { secret: "", insecureDev: true };
+  }
+  exitWithError(MISSING_S2S_SECRET_ERROR);
+}
+
+/**
+ * No secret: bind 127.0.0.1 only. A non-loopback MCP_HTTP_HOST refuses to
+ * start and is logged. A real secret honors MCP_HTTP_HOST, including
+ * 0.0.0.0, so container deploys stay on the image bind address.
+ */
+function resolveBindHost(insecureDev: boolean): string {
+  const configured = (process.env.MCP_HTTP_HOST ?? "").trim();
+  if (!insecureDev) return configured || SECRET_DEFAULT_HOST;
+  if (configured === "" || configured === LOOPBACK_HOST) return LOOPBACK_HOST;
+  if (isLoopbackHost(configured)) {
+    console.error(
+      `WARNING: MCP_HTTP_HOST=${configured} is loopback, but MCP_ALLOW_INSECURE_DEV=1 binds ${LOOPBACK_HOST} only.`
+    );
+    return LOOPBACK_HOST;
+  }
+  exitWithError(
+    "Refusing to start HTTP server: MCP_ALLOW_INSECURE_DEV=1 without CONDUIT_S2S_SECRET only binds 127.0.0.1. " +
+      `MCP_HTTP_HOST=${configured} is not loopback. Unset MCP_HTTP_HOST or set it to 127.0.0.1.`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Transport: HTTP (StreamableHTTPServerTransport)
 // ---------------------------------------------------------------------------
 
 let httpServer: HttpServer | undefined;
 
-async function startHttpTransport(): Promise<void> {
+export async function startHttpTransport(): Promise<HttpServer> {
+  const { secret: s2sSecret, insecureDev } = resolveHttpS2sSecret();
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
-  const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
+  const host = resolveBindHost(insecureDev);
   const authMode = process.env.AUTH_MODE || "env";
   const isGatewayMode = authMode === "gateway";
 
-  httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     // Health endpoint - no auth required
@@ -561,13 +680,12 @@ async function startHttpTransport(): Promise<void> {
     }
 
     if (url.pathname === "/mcp") {
-      if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+      // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1.
+      // A configured secret is always enforced. Placeholder secrets never
+      // reach this point — startup already exited.
+      if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
         res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.",
-          })
-        );
+        res.end(JSON.stringify(S2S_UNAUTHORIZED));
         return;
       }
 
@@ -583,16 +701,17 @@ async function startHttpTransport(): Promise<void> {
         return;
       }
 
-      // In gateway mode, extract credentials from headers and pass directly
-      // to avoid process.env race conditions under concurrent load.
+      // Gateway mode: credentials must arrive on every request via headers.
+      // Reject explicitly if missing rather than falling through — falling
+      // through would resolve KASEYA_BMS_* from the process environment,
+      // which is not request-scoped.
       let gatewayCredentials: KaseyaBmsCredentials | undefined;
       if (isGatewayMode) {
-        const headers = req.headers as Record<string, string | string[] | undefined>;
-        const tenantSubdomain = headers["x-kaseya-bms-tenant-subdomain"] as string | undefined;
+        const tenantSubdomain = headerValue(req.headers["x-kaseya-bms-tenant-subdomain"]);
         // Strip unresolved MCPB placeholders here too, so a blank optional field
         // forwarded as "${user_config.X}" never overrides a real token (issue #73).
-        const apiToken = cleanCredential(headers["x-kaseya-bms-api-token"] as string | undefined);
-        const kaseyaOneToken = cleanCredential(headers["x-kaseya-bms-k1-token"] as string | undefined);
+        const apiToken = cleanCredential(headerValue(req.headers["x-kaseya-bms-api-token"]));
+        const kaseyaOneToken = cleanCredential(headerValue(req.headers["x-kaseya-bms-k1-token"]));
 
         if (!tenantSubdomain || (!apiToken && !kaseyaOneToken)) {
           res.writeHead(401, { "Content-Type": "application/json" });
@@ -658,8 +777,12 @@ async function startHttpTransport(): Promise<void> {
     res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
   });
 
-  await new Promise<void>((resolve) => {
-    httpServer!.listen(port, host, () => {
+  httpServer = server;
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.off("error", onError);
       console.error(`Kaseya BMS MCP server listening on http://${host}:${port}/mcp`);
       console.error(`Health check available at http://${host}:${port}/health`);
       console.error(
@@ -668,6 +791,7 @@ async function startHttpTransport(): Promise<void> {
       resolve();
     });
   });
+  return server;
 }
 
 // ---------------------------------------------------------------------------
