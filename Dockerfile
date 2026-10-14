@@ -42,6 +42,12 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
+# MCP_HTTP_HOST=0.0.0.0 is the in-container bind. Startup still refuses to
+# run without a real CONDUIT_S2S_SECRET, so this does not expose
+# unauthenticated /mcp. MCP_ALLOW_INSECURE_DEV cannot widen the listener
+# off 127.0.0.1. AUTH_MODE stays env for existing single-tenant images;
+# the Compose gateway service sets AUTH_MODE=gateway and passes no static
+# vendor credentials.
 ENV NODE_ENV=production
 ENV MCP_TRANSPORT=http
 ENV MCP_HTTP_PORT=8080

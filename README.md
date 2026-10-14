@@ -39,30 +39,58 @@ needed. After editing `ui/`, regenerate the embedded bundle with
 
 ## Configuration
 
-### Environment-variable mode (default)
+Copy [`.env.example`](.env.example). Stdio and `AUTH_MODE=env` read the Kaseya BMS variables. Gateway mode does not.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `KASEYA_BMS_TENANT_SUBDOMAIN` | yes | Tenant subdomain (e.g. `yourcompany`) |
-| `KASEYA_BMS_API_TOKEN` | one of | BMS API token (secret) |
-| `KASEYA_BMS_K1_TOKEN` | one of | Kaseya One SSO token (secret) |
-| `MCP_TRANSPORT` | no | `stdio` (default) or `http` |
-| `MCP_HTTP_PORT` | no | HTTP listen port (default `8080`) |
-| `AUTH_MODE` | no | `env` (default) or `gateway` |
+| `KASEYA_BMS_TENANT_SUBDOMAIN` | For stdio and `AUTH_MODE=env` | Tenant subdomain (e.g. `yourcompany`) |
+| `KASEYA_BMS_API_TOKEN` | One of, for stdio and `AUTH_MODE=env` | BMS API token |
+| `KASEYA_BMS_K1_TOKEN` | One of, for stdio and `AUTH_MODE=env` | Kaseya One SSO token |
+| `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
+| `AUTH_MODE` | No | `env` (default) or `gateway`. Gateway mode requires `X-Kaseya-BMS-Tenant-Subdomain` plus `X-Kaseya-BMS-API-Token` or `X-Kaseya-BMS-K1-Token` on each `/mcp` request and never falls back to `KASEYA_BMS_*`. |
+| `CONDUIT_S2S_SECRET` | Yes for HTTP | Service-to-service secret. The HTTP server logs an error and exits non-zero when this is empty or a known placeholder. Compose will not start without it. Never commit a real value. Generate one with `openssl rand -hex 32`. |
+| `MCP_ALLOW_INSECURE_DEV` | No | Set to `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not enforce `X-Gateway-S2S`, and binds `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` refuses startup. A known placeholder secret is still refused. |
+| `MCP_HTTP_HOST` | No | Bind address when a real `CONDUIT_S2S_SECRET` is set. Unset keeps `0.0.0.0`, which is what the container image sets, so container deploys stay on every interface inside the container. Without a secret the dev bypass binds `127.0.0.1` instead. |
+| `MCP_HTTP_PORT` | No | HTTP port. Defaults to `8080`. |
 
-Either `KASEYA_BMS_API_TOKEN` OR `KASEYA_BMS_K1_TOKEN` is required.
+`/health` stays unauthenticated and does not read credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
 
-### Gateway mode
+### HTTP authentication
 
-When deployed behind the WYRE MCP Gateway, set `AUTH_MODE=gateway` and the
-server will read credentials from per-request HTTP headers:
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include `X-Gateway-S2S`. The value is `t=<unix seconds>,v1=<hex>`, where `v1` is HMAC-SHA256 of the exact string `t=<unix seconds>` keyed by `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be within 300 seconds of the server clock. A missing or invalid header returns 401. The secret is never written to logs.
 
-- `X-Kaseya-BMS-Tenant-Subdomain` (required)
-- `X-Kaseya-BMS-API-Token` (or)
-- `X-Kaseya-BMS-K1-Token`
+```js
+import { createHmac } from "node:crypto";
 
-Each request creates a fresh server instance with isolated credentials — no
-cross-tenant `process.env` pollution.
+const t = Math.floor(Date.now() / 1000);
+const v1 = createHmac("sha256", process.env.CONDUIT_S2S_SECRET)
+  .update(`t=${t}`)
+  .digest("hex");
+const xGatewayS2s = `t=${t},v1=${v1}`;
+```
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-Kaseya-BMS-Tenant-Subdomain` and either `X-Kaseya-BMS-API-Token` or `X-Kaseya-BMS-K1-Token`. Those headers are the only credential source for that request. A request missing them returns 401 and does not read `KASEYA_BMS_*` from the environment. Each request creates a fresh server instance with isolated credentials.
+
+### Docker Compose
+
+The checked-in Compose service is gateway mode. It publishes `127.0.0.1:8080:8080`, requires `CONDUIT_S2S_SECRET`, and does not set `KASEYA_BMS_TENANT_SUBDOMAIN`, `KASEYA_BMS_API_TOKEN`, `KASEYA_BMS_K1_TOKEN`, or `env_file`. The image build reads GitHub Packages credentials from the `npmrc` build secret (the repo `.npmrc` only sets the registry).
+
+```bash
+CONDUIT_S2S_SECRET="$(openssl rand -hex 32)" docker compose up --build
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `KASEYA_BMS_*`:
+
+```bash
+docker build -t kaseya-bms-mcp .
+docker run --rm \
+  -e CONDUIT_S2S_SECRET="$(openssl rand -hex 32)" \
+  -e AUTH_MODE=env \
+  -e KASEYA_BMS_TENANT_SUBDOMAIN=yourcompany \
+  -e KASEYA_BMS_API_TOKEN=... \
+  -p 127.0.0.1:8080:8080 \
+  kaseya-bms-mcp
+```
 
 ## Local development
 
@@ -74,21 +102,17 @@ KASEYA_BMS_TENANT_SUBDOMAIN=yourcompany \
   npm start
 ```
 
-Run as HTTP for testing:
+HTTP refuses to start until `CONDUIT_S2S_SECRET` is a real secret:
 
 ```bash
-MCP_TRANSPORT=http npm start
-curl http://localhost:8080/health
+MCP_TRANSPORT=http CONDUIT_S2S_SECRET="$(openssl rand -hex 32)" npm start
+curl http://127.0.0.1:8080/health
 ```
 
-## Docker
+Local HTTP without a secret is development-only. It binds `127.0.0.1` and logs a warning:
 
 ```bash
-docker build -t kaseya-bms-mcp .
-docker run --rm -p 8080:8080 \
-  -e KASEYA_BMS_TENANT_SUBDOMAIN=yourcompany \
-  -e KASEYA_BMS_API_TOKEN=... \
-  kaseya-bms-mcp
+MCP_TRANSPORT=http MCP_ALLOW_INSECURE_DEV=1 npm start
 ```
 
 ## License
